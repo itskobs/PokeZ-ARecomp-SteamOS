@@ -35,21 +35,17 @@
 #endif
 
 // zig's caches live in the install folder (zig-cache), but under Wine / Proton zig can fail to make its manifest files
-// there: "checking cache failed: manifest_create Unexpected" on the first file, every build (#165: a Steam Deck, the
-// folder in the Linux home through Z:, and on another drive H:), where zig doesn't know the error Wine gave back. Once
-// per build the caches move to the user's own local folder (%LOCALAPPDATA%\ZA Recomp\zig-cache: inside the Wine
-// prefix's C: drive; else the temp folder) and that file is compiled again. Logged with zig's message.
 static int zig_cache_moved;
 static bool zig_cache_elsewhere(const char *msg) {
     zig_cache_moved = 1;
     const char *base = getenv("LOCALAPPDATA");
+    if (!base || !*base) base = getenv("XDG_DATA_HOME");
+    if (!base || !*base) base = getenv("HOME");
     if (!base || !*base) base = getenv("TEMP");
     if (!base || !*base) base = getenv("TMPDIR");
     if (!base || !*base) return false;
     char d[1200];
-    snprintf(d, sizeof d, "%s" SEP "ZA Recomp", base);
-    mkdir(d, 0755);
-    strlcat(d, SEP "zig-cache", sizeof d);
+    snprintf(d, sizeof d, "%s" SEP ".zarecomp-zig-cache", base);
     mkdir(d, 0755);
 #ifdef _WIN32
     _putenv_s("ZIG_GLOBAL_CACHE_DIR", d);
@@ -57,6 +53,10 @@ static bool zig_cache_elsewhere(const char *msg) {
 #else
     setenv("ZIG_GLOBAL_CACHE_DIR", d, 1);
     setenv("ZIG_LOCAL_CACHE_DIR", d, 1);
+#endif
+    rt_launcher_log("[gamebuild] zig couldn't use its cache in the install folder (%s): its cache is now %s, trying again\n", msg, d);
+    return true;
+}
 #endif
     rt_launcher_log("[gamebuild] zig couldn't use its cache in the install folder (%s): its cache is now %s, trying again\n", msg, d);
     return true;
@@ -212,7 +212,7 @@ typedef struct {
     const char *name;
     char log[1100], out[1100];
     PlatProc p;
-    int exit;                // -1 while running
+    int exit;                // -1  running
     int files;               // chunk files written so far (complete)
     unsigned long long ci, n;  // functions written / all
     bool retried;            // started again after stopping with an empty log
@@ -537,63 +537,22 @@ bool gamebuild_run(const char *game_dir, const GameBuildOpts *o, char *why, size
     int next = 0, jobs = o->jobs < 1 ? 1 : o->jobs > 64 ? 64 : o->jobs;
     struct { PlatProc p; int unit; } run[64];
     int nrun = 0;
-    int reused = 0, compiled = 0;
-    unsigned long long done_bytes = 0;
-    double shown = 0;
-    {
-        add_unit(&units, t.entry, work, "gamelib_entry");
+    Units units = {0};
+    int queued[2] = {0, 0};  // chunk files of each module put in units so far
+    bool tables[2] = {false, false};
+    int next = 0, jobs = o->jobs < 1 ? 1 : o->jobs > 64 ? 64 : o->jobs;
+#ifdef __linux__
+    // On 16 GB SteamOS handhelds (Steam Deck, ROG Ally), unified RAM is shared with VRAM and tmpfs.
+    // Cap parallel zig cc processes to 3 (and 2 while the two Python/Unicorn generators are active) to prevent SIGKILL OOMs.
+    const char * env_jobs = getenv("LARECOMP_JOBS");
+    if (env_jobs && atoi(env_jobs) > 0) {
+        jobs = atoi(env_jobs);
+    } else if (jobs > 3) {
+        jobs = 3;
     }
-    while (ok) {
-        if (o->cancelled && o->cancelled()) {
-            snprintf(why, why_size, "Compilation cancelled. Completed files are kept for Resume."); ok = false; break;
-        }
-        // generator progress, newly finished files
-        bool gens_done = true;
-        double gen_frac = 0;
-        unsigned long long written = 0;
-        for (int i = 0; i < 2; i++) {
-            Gen *g = &gens[i];
-            if (g->exit < 0) {
-                read_gen_log(g);
-                int r = finished(g->p);
-                if (r >= 0) {
-                    g->exit = r;
-                    read_gen_log(g);
-                    // (stopped before its first line: once more, whatever stopped it may have been a scan of a new file, #99)
-                    if (r != 0 && !g->retried && gen_log_empty(g)) {
-                        g->retried = true;
-                        LOG("[gamebuild] generator (%s) stopped before writing anything (exit status %d): starting it again\n", g->name, r);
-                        g->p = gen_start(&t, g, i, game_dir);
-                        if (g->p) g->exit = -1;
-                    }
-                    if (g->exit < 0) {
-                    } else if (r != 0) {
-                        char what[64];
-                        snprintf(what, sizeof what, "generator (%s)", g->name);
-                        snprintf(why, why_size, "the game code couldn't be prepared");
-                        helper_failed(what, r, g->log, why, why_size);
-                        log_dump_tail(g->log);
-                        ok = false;
-                    } else if (!build_cache_save_generation(cache, g->name, g->files, why, why_size)) {
-                        ok = false;
-                    }
-                }
-            }
-            if (g->exit != 0) gens_done = false;
-            for (; queued[i] < g->files; queued[i]++) {
-                char src[1100], stem[64];
-                snprintf(stem, sizeof stem, "%s_%03d", g->name, queued[i]);
-                snprintf(src, sizeof src, "%s" SEP "%s.c", g->out, stem);
-                add_unit(&units, src, work, stem);
-            }
-            if (g->exit == 0 && !tables[i]) {
-                char src[1100], stem[64];
-                snprintf(stem, sizeof stem, "%s_table", g->name);
-                snprintf(src, sizeof src, "%s" SEP "%s.c", g->out, stem);
-                add_unit(&units, src, work, stem);
-                tables[i] = true;
-            }
-            gen_frac += g->exit == 0 ? 0.5 : g->n ? 0.5 * (double)g->ci / (double)g->n : 0;
+#endif
+    struct { PlatProc p; int unit; } run[64];
+    int nrun = 0;
         }
         if (!ok) break;
         for (int k = 0; k < units.n; k++) written += units.u[k].bytes;
@@ -659,7 +618,7 @@ bool gamebuild_run(const char *game_dir, const GameBuildOpts *o, char *why, size
         if (gens_done && next == units.n && nrun == 0) break;
 
         // progress: the generator's share (its functions written), the compiler's (bytes of C compiled, of an
-        // estimate of all of it while the generator still writes)
+        // estimate of all of it  the generator still writes)
         double est_total = gens_done ? (double)written : gen_frac > 0.02 ? (double)written / gen_frac : 0;
         double comp_frac = est_total > 0 ? (double)done_bytes / est_total : 0;
         if (comp_frac > 1) comp_frac = 1;
@@ -721,7 +680,7 @@ bool gamebuild_run(const char *game_dir, const GameBuildOpts *o, char *why, size
         PlatProc p = f ? spawn(a.v, log) : 0;
         args_free(&a);
         int r = p ? -1 : 255;
-        while (p && (r = finished(p)) < 0) {
+         (p && (r = finished(p)) < 0) {
             if (o->cancelled && o->cancelled()) { stop(p); r = 130; break; }
             sleep_ms(50);
         }
