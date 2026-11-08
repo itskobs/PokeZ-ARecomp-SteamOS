@@ -594,14 +594,36 @@ bool settings_list_has(const char *list, const char *name) {
     return false;
 }
 
-/// True on a Steam Deck (DMI vendor "Valve"): "Auto" button icons then use the Deck's own names (L1 R1 L2 R2 L3 R3).
+/// True on a Steam Deck or any handheld running SteamOS: "Auto" button icons and handheld operation mode use handheld defaults.
 int settings_on_steam_deck(void) {
     static int deck = -1;
     if (deck < 0) {
-        char v[32] = "";
+        const char *env = getenv("SteamDeck");
+        if (env && atoi(env) != 0) {
+            deck = 1;
+            return deck;
+        }
+        char v[64] = "";
         FILE *f = fopen("/sys/class/dmi/id/sys_vendor", "r");
         if (f) { if (!fgets(v, sizeof v, f)) v[0] = 0; fclose(f); }
-        deck = !strncmp(v, "Valve", 5);
+        if (!strncmp(v, "Valve", 5)) {
+            deck = 1;
+            return deck;
+        }
+        deck = 0;
+        f = fopen("/etc/os-release", "r");
+        if (f) {
+            char line[128];
+            while (fgets(line, sizeof line, f)) {
+                if (!strncmp(line, "ID=steamos", 10) || !strncmp(line, "ID=\"steamos\"", 12) ||
+                    !strncmp(line, "VARIANT_ID=steamdeck", 20)) {
+                    deck = 1;
+                    break;
+                }
+            }
+            fclose(f);
+        }
     }
     return deck;
+}
 }
