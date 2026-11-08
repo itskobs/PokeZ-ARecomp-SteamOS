@@ -5227,18 +5227,12 @@ static void heap_unmap_placed(void) {
 
 static bool guest_heap_dmabuf(void) {
     if (gmem_buf || !g_vk.dev || !(g_vk.dmabuf || g_vk.map_placed) || getenv("LARECOMP_VK_NO_GMEM")) return false;
+    // Pokémon Z-A has no heap at HEAP_BASE: its memory is the physical window (gwin). Mapping gmem_buf at HEAP_BASE
+    // prevents gmem_info() from importing gwin, causing all 3D world shaders to read an empty zero buffer.
+    extern bool game_files_are_la(const char *game_dir);
+    if (!g_game_is_la || !game_files_are_la("extracted")) return false;
     const char *e = getenv("LARECOMP_VK_HEAP_DMABUF");
     if (e ? !atoi(e) : !strstr(g_vk.props.deviceName, "RADV")) return false;
-    // Pokémon Z-A has no heap: its memory is the window (gwin: physical memory, 7676b00000 on 2.0.2), past the end of this
-    // mapping. gmem_buf set here kept gmem_info from importing that window, so shaders read this empty buffer: the world
-    // and all text black, the HUD art and 60 fps intact, no error (RX 7800 XT, RADV; an APU's system heap is too small to
-    // get here, which is why the Steam Deck never showed it). Asked of the files as gmem_chunk_shift does: this runs
-    // before the boot sets g_game_is_la. LARECOMP_VK_HEAP_DMABUF=1 still forces it.
-    extern bool game_files_are_la(const char *game_dir);
-    if (!e && (!g_game_is_la || !game_files_are_la("extracted"))) return false;
-    const uint64_t size = HEAP_MAX;
-    VkPhysicalDeviceMemoryProperties mp;
-    vkGetPhysicalDeviceMemoryProperties(g_vk.phys, &mp);
     const VkMemoryPropertyFlags want = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
                                        VK_MEMORY_PROPERTY_HOST_CACHED_BIT;  // (cached: the game's CPU work runs in it)
     int type = -1;
@@ -5527,26 +5521,29 @@ static void gmem_chunk_decide(void) {
     // Pokémon Z-A has no heap: its window (gwin: physical memory) is imported as one buffer, as before the chunks -
     // they are laid over HEAP_BASE / HEAP_MAX (data root's extracted/: asked here, the boot may come after this)
     extern bool game_files_are_la(const char *game_dir);
+   static void gmem_chunk_decide(void) {
+    int shift;
+    // Pokémon Z-A has no heap: its window (gwin: physical memory) is imported as one buffer, as before the chunks -
+    // they are laid over HEAP_BASE / HEAP_MAX (data root's extracted/: asked here, the boot may come after this)
+    extern bool game_files_are_la(const char *game_dir);
     if (!g_game_is_la || !game_files_are_la("extracted")) {
         gc_lazy = maxwell_gmem_lazy = maxwell_gmem_fs_miss = false;
         gc_shift = 0, gc_n = 0, gc_shift_decided = 0;
-        // Windows of the one import (no lazy chunks) where one storage buffer can't span the window: Dozen (DirectX 12)
-        // takes a storage buffer of 2^27 words at most (a raw view's elements: 512 MB; it reports 128), and every
-        // read past that came back 0 - Z-A's crowd shaders took a jump table entry of 0 and looped back to their
-        // start for good, the world drew nothing. LARECOMP_VK_GMEM_CHUNK_MB=<MB>: windows of that size on any GPU.
+        uint64_t wlo, wlen;
+        gmem_window_get(&wlo, &wlen);
+        // If gmem_window is active (default 256 MB on iGPUs and Linux RADV), the imported buffer is only ~320 MB,
+        // which is already well under AMD's 2 GB signed-offset limit and maxStorageBufferRange. Splitting it into
+        // 512 MB (sh = 29) chunks mismatches gwin_max vs gmem_size and binds dummy zero buffers.
+        if (gmem_window > 0) {
+            LOG("[vk] guest memory: using single %llu MB window import (chunking disabled for windowed import)\n",
+                (unsigned long long)(gmem_window >> 20));
+            return;
+        }
         const char *e = getenv("LARECOMP_VK_GMEM_CHUNK_MB");
         int sh = 0;
         if (e) { uint64_t b = strtoull(e, NULL, 10) << 20; if (b) sh = 63 - __builtin_clzll(b); }
         else if (g_vk.dozen) sh = 29;
-        // (AMD as well, whatever it reports - 4095 MB on an RX 9060 XT: past 2 GB into one buffer its reads go wrong as if
-        // the offset were a signed 32-bit number. The page faults of #146-#151 were always 960-980 MB BELOW the window's
-        // start = 4096 MB minus an offset of ~3.1 GB, near the top of the 3.2 GB window; the device losses after the
-        // crowd shaders (#154 #159 #162, a TDR) are Dozen's endless loop on reads that came back wrong. With 512 MB
-        // windows no offset reaches 2 GB: #151's RX 9060 XT played 31 min on Vulkan past its old crash, test-amd-windows.
-        // =0 above: one buffer, as before)
         else if (g_vk.props.vendorID == 0x1002) sh = 29;
-        // (also wherever one storage buffer can't reach the whole window: binding past maxStorageBufferRange is out of
-        // spec, and a driver may read 0 there as Dozen did - the crowd shaders' endless loop. Intel: 1 GB, #153)
         uint64_t lim = g_vk.props.limits.maxStorageBufferRange;
         if (!sh && !e && lim && gwin_max > lim) sh = lim >= (1ull << 29) ? 29 : 63 - __builtin_clzll(lim);
         if (sh > 30) sh = 30;
@@ -5568,14 +5565,6 @@ static void gmem_chunk_decide(void) {
             (unsigned long long)(gwin_max >> 20), (unsigned long long)(lim >> 20));
         return;
     }
-    const char *e = getenv("LARECOMP_VK_GMEM_CHUNK_MB");
-    uint64_t lim = g_vk.props.limits.maxStorageBufferRange;
-    gc_lazy = gmem_lazy();
-    shift = 0;
-    if (e) { uint64_t b = strtoull(e, NULL, 10) << 20; if (b) shift = 63 - __builtin_clzll(b); }
-    else if (gc_lazy) shift = 24;
-    else if (HEAP_MAX > lim && lim) shift = 63 - __builtin_clzll(lim);
-    if (shift > 30) shift = 30;  // (1 GB at most: NVIDIA computes a block's length in signed 32 bits, a 2 GB range reads as negative)
     // The table holds GC_MAX chunks at most, and a stage's storage buffers (the windows, gfast, binding 17) its limit
     // (Intel: 200): a chunk size that doesn't fit grows until it does (4 MB asked for -> 16 MB). One buffer only where
     // one buffer is within maxStorageBufferRange.
