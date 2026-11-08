@@ -57,10 +57,6 @@ static bool zig_cache_elsewhere(const char *msg) {
     rt_launcher_log("[gamebuild] zig couldn't use its cache in the install folder (%s): its cache is now %s, trying again\n", msg, d);
     return true;
 }
-#endif
-    rt_launcher_log("[gamebuild] zig couldn't use its cache in the install folder (%s): its cache is now %s, trying again\n", msg, d);
-    return true;
-}
 
 // ------------------------------------------------------------------ child processes
 // Every one running, so that quitting mid-build ends them too (atexit) instead of leaving compilers behind.
@@ -318,7 +314,7 @@ static void helper_failed(const char *what, int r, const char *log, char *why, s
         // (nothing written at all: not disk space, which is what the start screen would say next - something stopped it as
         // it started, or it crashed there: #99, a generator that worked on every other PC. gamebuild_killed: this text is shown)
         snprintf(why, why_size, "A build helper stopped as soon as it started. An antivirus or Windows' exploit protection can "
-                 "do this: add the ZA Recomp folder as an exception and try again.");
+                  "do this: add the ZA Recomp folder as an exception and try again.");
         g_killed = true;
     }
     LOG("[gamebuild] %s failed: %s%s%s\n", what, how, how[0] && last[0] ? ": " : "", last);
@@ -535,16 +531,10 @@ bool gamebuild_run(const char *game_dir, const GameBuildOpts *o, char *why, size
     int queued[2] = {0, 0};  // chunk files of each module put in units so far
     bool tables[2] = {false, false};
     int next = 0, jobs = o->jobs < 1 ? 1 : o->jobs > 64 ? 64 : o->jobs;
-    struct { PlatProc p; int unit; } run[64];
-    int nrun = 0;
-    Units units = {0};
-    int queued[2] = {0, 0};  // chunk files of each module put in units so far
-    bool tables[2] = {false, false};
-    int next = 0, jobs = o->jobs < 1 ? 1 : o->jobs > 64 ? 64 : o->jobs;
 #ifdef __linux__
     // On 16 GB SteamOS handhelds (Steam Deck, ROG Ally), unified RAM is shared with VRAM and tmpfs.
     // Cap parallel zig cc processes to 3 (and 2 while the two Python/Unicorn generators are active) to prevent SIGKILL OOMs.
-    const char * env_jobs = getenv("LARECOMP_JOBS");
+    const char *env_jobs = getenv("LARECOMP_JOBS");
     if (env_jobs && atoi(env_jobs) > 0) {
         jobs = atoi(env_jobs);
     } else if (jobs > 3) {
@@ -553,12 +543,75 @@ bool gamebuild_run(const char *game_dir, const GameBuildOpts *o, char *why, size
 #endif
     struct { PlatProc p; int unit; } run[64];
     int nrun = 0;
+    double shown = 0;
+    int reused = 0, compiled = 0;
+
+    while (ok) {
+        if (o->cancelled && o->cancelled()) {
+            LOG("[gamebuild] cancelled\n");
+            snprintf(why, why_size, "Compilation cancelled. Completed files are kept for Resume.");
+            ok = false;
+            break;
+        }
+        bool gens_done = true;
+        double gen_frac = 0;
+        unsigned long long written = 0, done_bytes = 0;
+        for (int i = 0; i < 2; i++) {
+            Gen *g = &gens[i];
+            if (g->exit < 0) {
+                read_gen_log(g);
+                int r = finished(g->p);
+                if (r >= 0) {
+                    read_gen_log(g);
+                    if (r != 0 && g_quitting) { ok = false; break; }
+                    if (r != 0 && !g->retried && gen_log_empty(g)) {
+                        g->retried = true;
+                        LOG("[gamebuild] generating %s stopped with an empty log (exit status %d): trying it again\n", g->name, r);
+                        g->p = gen_start(&t, g, i, game_dir);
+                        if (g->p) continue;
+                    }
+                    g->exit = r;
+                    if (r != 0) {
+                        char what[64];
+                        snprintf(what, sizeof what, "generating %s", g->name);
+                        snprintf(why, why_size, "the game code builder failed while reading the game files");
+                        helper_failed(what, r, g->log, why, why_size);
+                        log_dump_tail(g->log);
+                        ok = false;
+                        break;
+                    }
+                    if (!build_cache_save_generation(cache, g->name, g->files, why, why_size)) { ok = false; break; }
+                } else {
+                    gens_done = false;
+                }
+            }
+            static const double w[2] = {0.8, 0.2};
+            if (g->exit == 0) gen_frac += w[i];
+            else if (g->n > 0) gen_frac += w[i] * ((double)g->ci / (double)g->n);
+
+            if (units.n == 0 && i == 0 && (g->files > 0 || g->exit == 0))
+                add_unit(&units, t.entry, work, "gamelib_entry");
+            while (queued[i] < g->files) {
+                char src[1150], stem[64];
+                snprintf(stem, sizeof stem, "%s_%03d", g->name, queued[i]);
+                snprintf(src, sizeof src, "%s_%03d.c", g->out, queued[i]);
+                add_unit(&units, src, work, stem);
+                queued[i]++;
+            }
+            if (g->exit == 0 && !tables[i]) {
+                char src[1150], stem[64];
+                snprintf(stem, sizeof stem, "%s_tables", g->name);
+                snprintf(src, sizeof src, "%s_tables.c", g->out);
+                add_unit(&units, src, work, stem);
+                tables[i] = true;
+            }
         }
         if (!ok) break;
         for (int k = 0; k < units.n; k++) written += units.u[k].bytes;
 
         // compiles
-        while (nrun < jobs && next < units.n) {
+        int max_active = (!gens_done && jobs > 2) ? 2 : jobs;
+        while (nrun < max_active && next < units.n) {
             Unit *u = &units.u[next];
             int cached = build_cache_object(cache, u->stem, u->src, u->source_hash);
             if (cached < 0) { snprintf(why, why_size, "A generated source file is missing or unreadable."); ok = false; break; }
@@ -572,7 +625,7 @@ bool gamebuild_run(const char *game_dir, const GameBuildOpts *o, char *why, size
             int r = finished(run[k].p);
             if (r < 0) continue;
             Unit *u = &units.u[run[k].unit];
-            if (r != 0 && g_quitting) { ok = false; break; }  // (quitting mid-build ended the compilers: not a failure)
+if (r != 0 && g_quitting) { ok = false; break; }  // (quitting mid-build ended the compilers: not a failure)
             // (the generated C compiles everywhere, so a failure is the compiler dying: on #116 clang crashed on main_569 in
             // one build and main_016 in the next, 12 jobs on 16 GB. Each file gets two more tries, with half the jobs: a
             // crash here cost a player the whole build. A real error costs a few seconds and still ends as one)
@@ -680,7 +733,7 @@ bool gamebuild_run(const char *game_dir, const GameBuildOpts *o, char *why, size
         PlatProc p = f ? spawn(a.v, log) : 0;
         args_free(&a);
         int r = p ? -1 : 255;
-         (p && (r = finished(p)) < 0) {
+        while (p && (r = finished(p)) < 0) {
             if (o->cancelled && o->cancelled()) { stop(p); r = 130; break; }
             sleep_ms(50);
         }
